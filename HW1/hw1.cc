@@ -1,84 +1,130 @@
 #include <cstdio>
 #include <cstdlib>
-#include <vector>
 #include <mpi.h>
 #include <algorithm>
 #include <boost/sort/spreadsort/float_sort.hpp>
-#include <boost/sort/spreadsort/spreadsort.hpp>
 #include <nvtx3/nvToolsExt.h>
+#include <numa.h>
+#include <sched.h>
 
 using boost::sort::spreadsort::float_sort;
+#define BOOST_SPREADSORT_MAX_SPLITS 12
 
-// === partial merge function ===
-void merge_all_pair_partial(std::vector<float>& d, int partner, int rank) {
-    int n = d.size();
+void merge_all_pair_partial(float* d, int n, int partner, int rank, int size, int N,
+                            float* recvbuf, int recvbuf_cap, float* keep) {
+    int partner_n = N/size + (partner < N % size ? 1 : 0);
+    if (n == 0 || partner_n == 0) return;
 
-    // 交換大小
-    int partner_n = 0;
-    MPI_Sendrecv(&n, 1, MPI_INT, partner, 0,
-                 &partner_n, 1, MPI_INT, partner, 0,
-                 MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+    float my_min = d[0];
+    float my_max = d[n-1];
+    float partner_val;
 
-    // 交換資料
-    std::vector<float> partner_buf(partner_n);
-    MPI_Sendrecv(d.data(), n, MPI_FLOAT, partner, 1,
-                 partner_buf.data(), partner_n, MPI_FLOAT, partner, 1,
-                 MPI_COMM_WORLD, MPI_STATUS_IGNORE);
-    
-    nvtxRangePush("Merging");
+    // Boundary check
+    bool need_exchange = true;
+    if (rank < partner) {
+        MPI_Sendrecv(&my_max, 1, MPI_FLOAT, partner, 0,
+                     &partner_val, 1, MPI_FLOAT, partner, 0,
+                     MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+        if (my_max <= partner_val) need_exchange = false;
+    } else {
+        MPI_Sendrecv(&my_min, 1, MPI_FLOAT, partner, 0,
+                     &partner_val, 1, MPI_FLOAT, partner, 0,
+                     MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+        if (partner_val <= my_min) need_exchange = false;
+    }
+    if (!need_exchange) return;
 
-    // === 部分 merge ===
-    std::vector<float> keep;
-    keep.reserve(n);
+    // Binary Search
+    nvtxRangePush("Binary Search");
+    int send_size = 0;
+    float *sendbuf = nullptr;
 
     if (rank < partner) {
-        // 左邊 rank：保留最小的 n 個
-        int i = 0, j = 0;
-        while ((int)keep.size() < n) {
-            if (i < (int)d.size() && (j >= (int)partner_buf.size() || d[i] <= partner_buf[j])) {
-                keep.push_back(d[i++]);
-            } else {
-                keep.push_back(partner_buf[j++]);
-            }
-        }
-        d.swap(keep);
+        float partner_min = partner_val;
+        int cut_idx = (int)(std::upper_bound(d, d+n, partner_min) - d);
+        send_size = n - cut_idx;
+        if (send_size > 0) sendbuf = d + cut_idx;
     } else {
-        // 右邊 rank：保留最大的 n 個
-        int i = d.size() - 1, j = partner_buf.size() - 1;
-        while ((int)keep.size() < n) {
-            if (i >= 0 && (j < 0 || d[i] >= partner_buf[j])) {
-                keep.push_back(d[i--]);
-            } else {
-                keep.push_back(partner_buf[j--]);
-            }
-        }
-        std::reverse(keep.begin(), keep.end()); // 從大到小挑，要反轉
-        d.swap(keep);
+        float partner_max = partner_val;
+        int cut_idx = (int)(std::upper_bound(d, d+n, partner_max) - d);
+        send_size = cut_idx;
+        if (send_size > 0) sendbuf = d;
     }
     nvtxRangePop();
+
+    // Transfer sizes
+    int recv_size = 0;
+    MPI_Sendrecv(&send_size, 1, MPI_INT, partner, 1,
+                 &recv_size, 1, MPI_INT, partner, 1,
+                 MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+
+    if (recv_size > recvbuf_cap) {
+        fprintf(stderr, "[rank %d] recv_size=%d > cap=%d (partner=%d)\n",
+                rank, recv_size, recvbuf_cap, partner);
+        MPI_Abort(MPI_COMM_WORLD, 1);
+    }
+
+    // Transfer data
+    float *send_ptr = (send_size > 0) ? sendbuf : d;
+    float *recv_ptr = (recv_size > 0) ? recvbuf : d;
+
+    MPI_Sendrecv(send_ptr, send_size, MPI_FLOAT, partner, 2,
+                 recv_ptr, recv_size, MPI_FLOAT, partner, 2,
+                 MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+
+    // Merge
+    nvtxRangePush("Merge");
+    if (rank < partner) {
+        // Left rank
+        int i = 0, j = 0, k = 0;
+        while (k < n) {
+            if (j >= recv_size || (i < n && d[i] <= recvbuf[j])) {
+                keep[k++] = d[i++];
+            } else {
+                keep[k++] = recvbuf[j++];
+            }
+        }
+    } else {
+        // Right rank
+        int i = n - 1, j = recv_size - 1, k = n - 1;
+        while (k >= 0) {
+            if (j < 0 || (i >= 0 && d[i] >= recvbuf[j])) {
+                keep[k--] = d[i--];
+            } else {
+                keep[k--] = recvbuf[j--];
+            }
+        }
+    }
+    nvtxRangePop();
+
+    // Copy back
+    std::copy(keep, keep + n, d);
 }
 
-// === even phase ===
-void even_odd(std::vector<float>& d, int rank, int size) {
+// even phase
+void even_odd(float* d, int n, int rank, int size, int N, int phase,
+              float* recvbuf, float* keep, int recvbuf_cap) {
     if (rank % 2 == 0 && rank + 1 < size) {
-        merge_all_pair_partial(d, rank + 1, rank);
+        merge_all_pair_partial(d, n, rank + 1, rank, size, N, recvbuf, recvbuf_cap, keep);
     } else if (rank % 2 == 1) {
-        merge_all_pair_partial(d, rank - 1, rank);
+        merge_all_pair_partial(d, n, rank - 1, rank, size, N, recvbuf, recvbuf_cap, keep);
     }
 }
 
-// === odd phase ===
-void odd_even(std::vector<float>& d, int rank, int size) {
+// odd phase
+void odd_even(float* d, int n, int rank, int size, int N, int phase,
+              float* recvbuf, float* keep, int recvbuf_cap) {
     if (rank % 2 == 1 && rank + 1 < size) {
-        merge_all_pair_partial(d, rank + 1, rank);
+        merge_all_pair_partial(d, n, rank + 1, rank, size, N, recvbuf, recvbuf_cap, keep);
     } else if (rank % 2 == 0 && rank > 0) {
-        merge_all_pair_partial(d, rank - 1, rank);
+        merge_all_pair_partial(d, n, rank - 1, rank, size, N, recvbuf, recvbuf_cap, keep);
     }
 }
 
 int main(int argc, char **argv)
 {
     nvtxRangePush("All");
+    setenv("UCX_NET_DEVICES", "ibp3s0:1", 1);
     MPI_Init(&argc, &argv);
 
     int rank, size;
@@ -88,94 +134,58 @@ int main(int argc, char **argv)
     int N = atoi(argv[1]);
     const char *const input_filename = argv[2],
                *const output_filename = argv[3];
-    //printf("rank %d of %d processes, N=%d\n", rank, size, N);
 
     int rank_size = N/size + (rank < N % size ? 1 : 0);
-    int start = rank * (N / size) + (rank < N % size ? rank : N % size);
+    int start     = rank * (N / size) + (rank < N % size ? rank : N % size);
 
-   
+    int max_chunk = N/size + 1; 
 
-    std::vector<float> d(rank_size);
-
+    int cpu = sched_getcpu();
+    int numa_node = numa_node_of_cpu(cpu);
     
+    // Data Arrays
+    float *d       = (float*)numa_alloc_onnode(sizeof(float) * std::max(1, rank_size), numa_node);
+    float *recvbuf = (float*)numa_alloc_onnode(sizeof(float) * std::max(1, max_chunk), numa_node);
+    float *keep    = (float*)numa_alloc_onnode(sizeof(float) * std::max(1, rank_size), numa_node);
 
     MPI_File input_file, output_file;
+    // File Input
     MPI_File_open(MPI_COMM_SELF, input_filename, MPI_MODE_RDONLY, MPI_INFO_NULL, &input_file);
     MPI_File_read_at(input_file,
         sizeof(float) * start,
-        d.data(),
+        d,
         rank_size,
         MPI_FLOAT,
         MPI_STATUS_IGNORE);
     MPI_File_close(&input_file);
 
-    //std::sort(d.begin(), d.end());
     nvtxRangePush("Sorting");
-    float_sort(d.begin(), d.end());
+    float_sort(d, d + rank_size);
     nvtxRangePop();
-    //boost::sort::spreadsort::spreadsort(d.begin(), local_chunk.end());
 
-    //for (int i = 0; i < rank_size; i++) {
-    //    printf("rank %d will write data[%d] = %f\n", rank, start + i, d[i]);
-    //}
-    //printf("rank %d wrote %d floats starting at index %d\n", rank, rank_size, start);
-    //printf("%d", N);
-    if(N > 100'000'000){
-        //printf("Too large N, skip sorting\n");
-        for (int phase = 0; phase < size/2; ++phase) {
-            even_odd(d, rank, size);
-            odd_even(d, rank, size);
-        }
+    // Sort and Merge
+    for (int phase = 0; phase < size/2 + 1; ++phase) {
+        even_odd(d, rank_size, rank, size, N, phase, recvbuf, keep, max_chunk);
+        odd_even(d, rank_size, rank, size, N, phase, recvbuf, keep, max_chunk);
     }
-    else{
-        for (int phase = 0; phase < size/2 + 1; ++phase) {
-            even_odd(d, rank, size);
-            odd_even(d, rank, size);
-        }
-    }
+
+    // File Output
     MPI_File_open(MPI_COMM_SELF, output_filename, MPI_MODE_CREATE | MPI_MODE_WRONLY, MPI_INFO_NULL, &output_file);
     MPI_File_write_at(output_file,
         sizeof(float) * start,
-        d.data(),
+        d,
         rank_size,
         MPI_FLOAT,
         MPI_STATUS_IGNORE);
     MPI_File_close(&output_file);
-    // === 收集結果到 rank 0 ===
-    //int local_n = d.size();
-    //std::vector<int> counts(size), displs(size);
 
-    //MPI_Gather(&local_n, 1, MPI_INT, counts.data(), 1, MPI_INT, 0, MPI_COMM_WORLD);
-
-    // rank 0 計算 displs
-    //int total_n = 0;
-    //if (rank == 0) {
-    //    displs[0] = 0;
-    //    for (int i = 0; i < size; i++) {
-    //        if (i > 0) displs[i] = displs[i-1] + counts[i-1];
-    //    }
-    //    for (int i = 0; i < size; i++) total_n += counts[i];
-    //}
-
-    //std::vector<float> all_data;
-    //if (rank == 0) all_data.resize(total_n);
-
-    //MPI_Gatherv(d.data(), local_n, MPI_FLOAT,
-    //            all_data.data(), counts.data(), displs.data(),
-    //            MPI_FLOAT, 0, MPI_COMM_WORLD);
-
-    //if (rank == 0) {
-    //    printf("\n=== Final sorted result ===\n");
-    //    for (int i = 0; i < 100; i++) {
-    //        printf("%f ", all_data[i]);
-    //        if ((i+1) % 8 == 0) printf("\n"); // 每8個換行，美觀一點
-    //    }
-    //    printf("\n");
-    //}
+    // Free Memory
+    numa_free(d, sizeof(float) * (rank_size));
+    numa_free(recvbuf, sizeof(float) * std::max(1, max_chunk));
+    numa_free(keep, sizeof(float) * std::max(1, rank_size));
 
     MPI_Barrier(MPI_COMM_WORLD);
     MPI_Finalize();
     nvtxRangePop();
     return 0;
 }
-
