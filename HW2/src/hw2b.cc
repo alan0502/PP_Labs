@@ -20,12 +20,12 @@ static inline void mandelbrot_row_sse2(
     double left, double x_scale, double y0,
     int iters, int width, int *row_out)
 {
-    const __m128d v_left = _mm_set1_pd(left);
-    const __m128d v_dx   = _mm_set1_pd(x_scale);
-    const __m128d v_y0   = _mm_set1_pd(y0);
-    const __m128d v_four = _mm_set1_pd(4.0);
-    const __m128d v_one  = _mm_set1_pd(1.0);
-    const __m128d v_two  = _mm_set1_pd(2.0);
+    const __m128d v_left = _mm_set1_pd(left); // The left boundary
+    const __m128d v_dx   = _mm_set1_pd(x_scale); // The delta x per pixel
+    const __m128d v_y0   = _mm_set1_pd(y0); // The y0 for this row，because y0 is constant in a row
+    const __m128d v_four = _mm_set1_pd(4.0); // 4.0
+    const __m128d v_one  = _mm_set1_pd(1.0); // 1.0
+    const __m128d v_two  = _mm_set1_pd(2.0); // 2.0
 
     int i = 0;
     for (; i + 5 < width; i += 6) {
@@ -34,16 +34,17 @@ static inline void mandelbrot_row_sse2(
         __m128d idx2 = _mm_set_pd(i + 3, i + 2);
         __m128d idx3 = _mm_set_pd(i + 5, i + 4);
 
+        // Compute the initial complex numbers c = x + iy
         __m128d cx1 = idx1 * v_dx + v_left;
         __m128d cx2 = idx2 * v_dx + v_left;
         __m128d cx3 = idx3 * v_dx + v_left;
-
         __m128d cy1 = v_y0, cy2 = v_y0, cy3 = v_y0;
+
         __m128d x1 = _mm_setzero_pd(), y1 = _mm_setzero_pd(), itv1 = _mm_setzero_pd();
         __m128d x2 = _mm_setzero_pd(), y2 = _mm_setzero_pd(), itv2 = _mm_setzero_pd();
         __m128d x3 = _mm_setzero_pd(), y3 = _mm_setzero_pd(), itv3 = _mm_setzero_pd();
 
-        int maskb1 = 3, maskb2 = 3, maskb3 = 3;
+        int maskb1 = 3, maskb2 = 3, maskb3 = 3; // initially all active (11 in binary)
 
         __m128d mask1 = _mm_set1_pd(-1LL);
         __m128d mask2 = _mm_set1_pd(-1LL);
@@ -55,15 +56,18 @@ static inline void mandelbrot_row_sse2(
             __m128d y2_1 = y1 * y1;
             __m128d r2_1 = x2_1 + y2_1;
 
-            // If the value < 4.0, then set mask1 to all 1s, else all 0s
+            // Considering the mask into left and right parts, if the value < 4.0, then set the sub-mask to all 1s, else all 0s
+            // For example, if r2_1 = [3.0, 5.0], then mask1 = [all 1s, all 0s]
             mask1 = r2_1 < v_four;
 
-            // If mask1 is not zero, continue the iteration
+            // If mask1 is not zero in last iteration, continue the iteration
+            // If maskb1 != 0, it means at least one of the two pixels in this group is still active
             if (maskb1 != 0) {
                 __m128d xy1 = x1 * y1;
                 x1 = x2_1 - y2_1 + cx1;
                 y1 = v_two * xy1 + cy1;
-                itv1 += _mm_and_pd(mask1, v_one);
+                itv1 += _mm_and_pd(mask1, v_one); // Increment the iteration count only for active pixels, [+1 or +0, +1 or +0]
+                // If some pixels change from active to inactive in this iteration, they will not be counted in next iterations
             }
 
             // Group 2
@@ -74,7 +78,7 @@ static inline void mandelbrot_row_sse2(
             // If the value < 4.0, then set mask2 to all 1s, else all 0s
             mask2 = r2_2 < v_four;
 
-            // If mask2 is not zero, continue the iteration
+            // If mask2 is not zero in last iteration, continue the iteration
             if (maskb2 != 0) {
                 __m128d xy2 = x2 * y2;
                 x2 = x2_2 - y2_2 + cx2;
@@ -90,7 +94,7 @@ static inline void mandelbrot_row_sse2(
             // If the value < 4.0, then set mask3 to all 1s, else all 0s
             mask3 = r2_3 < v_four;
 
-            // If mask3 is not zero, continue the iteration
+            // If mask3 is not zero in last iteration, continue the iteration
             if (maskb3 != 0) {
                 __m128d xy3 = x3 * y3;
                 x3 = x2_3 - y2_3 + cx3;
@@ -99,6 +103,7 @@ static inline void mandelbrot_row_sse2(
                 itv3 += _mm_and_pd(mask3, v_one);
             }
 
+            // Determine the new masks for next iteration, transform from __m128d to int
             maskb1 = _mm_movemask_pd(mask1);
             maskb2 = _mm_movemask_pd(mask2);
             maskb3 = _mm_movemask_pd(mask3);
@@ -108,11 +113,13 @@ static inline void mandelbrot_row_sse2(
                 break;
         }
 
+        // Store the iteration counts back to memory
         double tmp1[2], tmp2[2], tmp3[2];
         _mm_storeu_pd(tmp1, itv1);
         _mm_storeu_pd(tmp2, itv2);
         _mm_storeu_pd(tmp3, itv3);
 
+        // Store 6 pixels
         row_out[i]   = (int)(tmp1[0] + 0.5);
         row_out[i+1] = (int)(tmp1[1] + 0.5);
         row_out[i+2] = (int)(tmp2[0] + 0.5);
@@ -122,6 +129,7 @@ static inline void mandelbrot_row_sse2(
     }
 
     // scalar tail
+    // If the width is not a multiple of 6, handle the remaining pixels
     for (; i < width; ++i) {
         double x0 = i * x_scale + left;
         double x = 0.0, y = 0.0;
@@ -154,7 +162,9 @@ void write_png(const char* filename, int iters, int width, int height, const int
     png_bytep image_data = (png_bytep)malloc(row_size * height);
     png_bytep* rows = (png_bytep*)malloc(sizeof(png_bytep) * height);
     png_bytep row;
-    # pragma omp parallel for linear(row:row_size) schedule(static)
+
+    // Every row is independent, we can parallelize this loop
+    #pragma omp parallel for schedule(static)
     for (int y = 0; y < height; ++y) {
         row = image_data + y * row_size;
         rows[y] = row;
@@ -201,6 +211,7 @@ int main(int argc, char** argv) {
     int width = strtol(argv[7], 0, 10);
     int height = strtol(argv[8], 0, 10);
 
+    // Compute the length per pixel
     double x_scale = (right - left) / width;
     double y_scale = (upper - lower) / height;
 
@@ -221,9 +232,15 @@ int main(int argc, char** argv) {
 
     // Gather using MPI_Gatherv 
     nvtxRangePop(); nvtxRangePush("Comm");
+
+    // Prepare recvcounts and displs
+    // local_count: number of elements to send from each process, sender's perspective
+    // recvcounts: number of elements to receive from each process, root's perspective
+    // displs: displacement (offset) for each process's data in the recv buffer, root's perspective
     int local_count = width * local_height;
     int *recvcounts = NULL, *displs = NULL;
 
+    // recvcounts and displs are similar as counting sorted to distribute rows to buffers
     int total_count = 0;
     if (rank == 0) {
         recvcounts = (int*)malloc(size * sizeof(int));
@@ -242,6 +259,9 @@ int main(int argc, char** argv) {
         total_count = displs[size - 1] + recvcounts[size - 1];
     }
 
+    // Gather all local images to root process by MPI_Gatherv
+    // Non-root processes pass NULL for recvbuf, recvcounts, displs, but pass local_image and local_count
+    // Root process allocates buffer to receive all data
     int* gathered = NULL;
     if (rank == 0)
         gathered = (int*)malloc(total_count * sizeof(int));
