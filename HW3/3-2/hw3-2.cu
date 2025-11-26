@@ -2,7 +2,13 @@
 #include <stdlib.h>
 #include <cuda_runtime.h>
 
+#ifndef TILE_SIZE
 #define TILE_SIZE 64
+#endif
+
+#define WORK_PER_THREAD 4
+
+#define BLOCK_DIM (TILE_SIZE / WORK_PER_THREAD)
 
 const unsigned short INF = 65535;
 
@@ -20,22 +26,25 @@ __global__ void phase1_kernel(unsigned short* __restrict__ d_Dist, int n, int Ro
     int tx = threadIdx.x; 
     int ty = threadIdx.y; 
 
-    int row_start = ty * 4;
-    int col_start = tx * 4;
+    int row_start = ty * WORK_PER_THREAD;
+    int col_start = tx * WORK_PER_THREAD;
 
     int global_row_start = Round * TILE_SIZE + row_start;
     int global_col_start = Round * TILE_SIZE + col_start;
 
     #pragma unroll
-    for (int i = 0; i < 4; ++i) {
+    for (int i = 0; i < WORK_PER_THREAD; ++i) {
         int r = global_row_start + i;
-        int c = global_col_start;
-        if (r < n && c < n) {
-             ushort4 val = *reinterpret_cast<ushort4*>(&d_Dist[r * n + c]);
-             tile[row_start + i][col_start + 0] = val.x;
-             tile[row_start + i][col_start + 1] = val.y;
-             tile[row_start + i][col_start + 2] = val.z;
-             tile[row_start + i][col_start + 3] = val.w;
+        #pragma unroll
+        for (int j = 0; j < WORK_PER_THREAD; j += 4) {
+            int c = global_col_start + j;
+            if (r < n && c < n) {
+                 ushort4 val = *reinterpret_cast<ushort4*>(&d_Dist[r * n + c]);
+                 tile[row_start + i][col_start + j + 0] = val.x;
+                 tile[row_start + i][col_start + j + 1] = val.y;
+                 tile[row_start + i][col_start + j + 2] = val.z;
+                 tile[row_start + i][col_start + j + 3] = val.w;
+            }
         }
     }
 
@@ -43,18 +52,18 @@ __global__ void phase1_kernel(unsigned short* __restrict__ d_Dist, int n, int Ro
 
     #pragma unroll
     for (int k = 0; k < TILE_SIZE; ++k) {
-        int a[4];
-        int b[4];
+        int a[WORK_PER_THREAD];
+        int b[WORK_PER_THREAD];
         
         #pragma unroll
-        for(int i=0; i<4; ++i) a[i] = tile[row_start + i][k];
+        for(int i=0; i<WORK_PER_THREAD; ++i) a[i] = tile[row_start + i][k];
         #pragma unroll
-        for(int j=0; j<4; ++j) b[j] = tile[k][col_start + j];
+        for(int j=0; j<WORK_PER_THREAD; ++j) b[j] = tile[k][col_start + j];
         
         #pragma unroll
-        for(int i=0; i<4; ++i) {
+        for(int i=0; i<WORK_PER_THREAD; ++i) {
             #pragma unroll
-            for(int j=0; j<4; ++j) {
+            for(int j=0; j<WORK_PER_THREAD; ++j) {
                 tile[row_start + i][col_start + j] = min((int)tile[row_start + i][col_start + j], a[i] + b[j]);
             }
         }
@@ -62,16 +71,19 @@ __global__ void phase1_kernel(unsigned short* __restrict__ d_Dist, int n, int Ro
     }
     
     #pragma unroll
-    for (int i = 0; i < 4; ++i) {
+    for (int i = 0; i < WORK_PER_THREAD; ++i) {
         int r = global_row_start + i;
-        int c = global_col_start;
-        if (r < n && c < n) {
-            ushort4 val;
-            val.x = tile[row_start + i][col_start + 0];
-            val.y = tile[row_start + i][col_start + 1];
-            val.z = tile[row_start + i][col_start + 2];
-            val.w = tile[row_start + i][col_start + 3];
-            *reinterpret_cast<ushort4*>(&d_Dist[r * n + c]) = val;
+        #pragma unroll
+        for (int j = 0; j < WORK_PER_THREAD; j += 4) {
+            int c = global_col_start + j;
+            if (r < n && c < n) {
+                ushort4 val;
+                val.x = tile[row_start + i][col_start + j + 0];
+                val.y = tile[row_start + i][col_start + j + 1];
+                val.z = tile[row_start + i][col_start + j + 2];
+                val.w = tile[row_start + i][col_start + j + 3];
+                *reinterpret_cast<ushort4*>(&d_Dist[r * n + c]) = val;
+            }
         }
     }
 }
@@ -82,8 +94,8 @@ __global__ void phase2_kernel(unsigned short* __restrict__ d_Dist, int n, int Ro
     
     int tx = threadIdx.x;
     int ty = threadIdx.y;
-    int row_start = ty * 4;
-    int col_start = tx * 4;
+    int row_start = ty * WORK_PER_THREAD;
+    int col_start = tx * WORK_PER_THREAD;
     
     int blk_idx = blockIdx.x;
     if (blk_idx == Round) return;
@@ -104,74 +116,83 @@ __global__ void phase2_kernel(unsigned short* __restrict__ d_Dist, int n, int Ro
     }
     
     #pragma unroll
-    for (int i = 0; i < 4; ++i) {
+    for (int i = 0; i < WORK_PER_THREAD; ++i) {
         int r = pivot_row_start + i;
-        int c = pivot_col_start;
-        ushort4 val = *reinterpret_cast<ushort4*>(&d_Dist[r * n + c]);
-        pivot[row_start + i][col_start + 0] = val.x;
-        pivot[row_start + i][col_start + 1] = val.y;
-        pivot[row_start + i][col_start + 2] = val.z;
-        pivot[row_start + i][col_start + 3] = val.w;
+        #pragma unroll
+        for (int j = 0; j < WORK_PER_THREAD; j += 4) {
+            int c = pivot_col_start + j;
+            ushort4 val = *reinterpret_cast<ushort4*>(&d_Dist[r * n + c]);
+            pivot[row_start + i][col_start + j + 0] = val.x;
+            pivot[row_start + i][col_start + j + 1] = val.y;
+            pivot[row_start + i][col_start + j + 2] = val.z;
+            pivot[row_start + i][col_start + j + 3] = val.w;
+        }
     }
     
     #pragma unroll
-    for (int i = 0; i < 4; ++i) {
+    for (int i = 0; i < WORK_PER_THREAD; ++i) {
         int r = target_row_start + i;
-        int c = target_col_start;
-        ushort4 val = *reinterpret_cast<ushort4*>(&d_Dist[r * n + c]);
-        target[row_start + i][col_start + 0] = val.x;
-        target[row_start + i][col_start + 1] = val.y;
-        target[row_start + i][col_start + 2] = val.z;
-        target[row_start + i][col_start + 3] = val.w;
+        #pragma unroll
+        for (int j = 0; j < WORK_PER_THREAD; j += 4) {
+            int c = target_col_start + j;
+            ushort4 val = *reinterpret_cast<ushort4*>(&d_Dist[r * n + c]);
+            target[row_start + i][col_start + j + 0] = val.x;
+            target[row_start + i][col_start + j + 1] = val.y;
+            target[row_start + i][col_start + j + 2] = val.z;
+            target[row_start + i][col_start + j + 3] = val.w;
+        }
     }
     
     __syncthreads();
     
-    int t_val[4][4];
+    int t_val[WORK_PER_THREAD][WORK_PER_THREAD];
     #pragma unroll
-    for(int i=0; i<4; ++i) {
+    for(int i=0; i<WORK_PER_THREAD; ++i) {
         #pragma unroll
-        for(int j=0; j<4; ++j) {
+        for(int j=0; j<WORK_PER_THREAD; ++j) {
             t_val[i][j] = target[row_start + i][col_start + j];
         }
     }
     
     #pragma unroll
     for (int k = 0; k < TILE_SIZE; ++k) {
-        int a[4]; 
-        int b[4]; 
+        int a[WORK_PER_THREAD]; 
+        int b[WORK_PER_THREAD]; 
         
         if (mode == 0) { 
             #pragma unroll
-            for(int i=0; i<4; ++i) a[i] = pivot[row_start + i][k];
+            for(int i=0; i<WORK_PER_THREAD; ++i) a[i] = pivot[row_start + i][k];
             #pragma unroll
-            for(int j=0; j<4; ++j) b[j] = target[k][col_start + j];
+            for(int j=0; j<WORK_PER_THREAD; ++j) b[j] = target[k][col_start + j];
         } else { 
             #pragma unroll
-            for(int i=0; i<4; ++i) a[i] = target[row_start + i][k];
+            for(int i=0; i<WORK_PER_THREAD; ++i) a[i] = target[row_start + i][k];
             #pragma unroll
-            for(int j=0; j<4; ++j) b[j] = pivot[k][col_start + j];
+            for(int j=0; j<WORK_PER_THREAD; ++j) b[j] = pivot[k][col_start + j];
         }
         
         #pragma unroll
-        for (int i = 0; i < 4; ++i) {
+        for (int i = 0; i < WORK_PER_THREAD; ++i) {
             #pragma unroll
-            for (int j = 0; j < 4; ++j) {
+            for (int j = 0; j < WORK_PER_THREAD; ++j) {
                 t_val[i][j] = min(t_val[i][j], a[i] + b[j]);
             }
         }
     }
     
     #pragma unroll
-    for (int i = 0; i < 4; ++i) {
+    for (int i = 0; i < WORK_PER_THREAD; ++i) {
         int r = target_row_start + i;
-        int c = target_col_start;
-        ushort4 val;
-        val.x = t_val[i][0];
-        val.y = t_val[i][1];
-        val.z = t_val[i][2];
-        val.w = t_val[i][3];
-        *reinterpret_cast<ushort4*>(&d_Dist[r * n + c]) = val;
+        #pragma unroll
+        for (int j = 0; j < WORK_PER_THREAD; j += 4) {
+            int c = target_col_start + j;
+            ushort4 val;
+            val.x = t_val[i][j + 0];
+            val.y = t_val[i][j + 1];
+            val.z = t_val[i][j + 2];
+            val.w = t_val[i][j + 3];
+            *reinterpret_cast<ushort4*>(&d_Dist[r * n + c]) = val;
+        }
     }
 }
 
@@ -186,35 +207,41 @@ __global__ void phase3_kernel(unsigned short* __restrict__ d_Dist, int n, int Ro
     
     int tx = threadIdx.x;
     int ty = threadIdx.y;
-    int row_start = ty * 4;
-    int col_start = tx * 4;
+    int row_start = ty * WORK_PER_THREAD;
+    int col_start = tx * WORK_PER_THREAD;
     
     int row_row_start = by * TILE_SIZE + row_start;
     int row_col_start = Round * TILE_SIZE + col_start;
     
     #pragma unroll
-    for (int i = 0; i < 4; ++i) {
+    for (int i = 0; i < WORK_PER_THREAD; ++i) {
         int r = row_row_start + i;
-        int c = row_col_start;
-        ushort4 val = *reinterpret_cast<ushort4*>(&d_Dist[r * n + c]);
-        row_tile[row_start + i][col_start + 0] = val.x;
-        row_tile[row_start + i][col_start + 1] = val.y;
-        row_tile[row_start + i][col_start + 2] = val.z;
-        row_tile[row_start + i][col_start + 3] = val.w;
+        #pragma unroll
+        for (int j = 0; j < WORK_PER_THREAD; j += 4) {
+            int c = row_col_start + j;
+            ushort4 val = *reinterpret_cast<ushort4*>(&d_Dist[r * n + c]);
+            row_tile[row_start + i][col_start + j + 0] = val.x;
+            row_tile[row_start + i][col_start + j + 1] = val.y;
+            row_tile[row_start + i][col_start + j + 2] = val.z;
+            row_tile[row_start + i][col_start + j + 3] = val.w;
+        }
     }
     
     int c_row_start = Round * TILE_SIZE + row_start;
     int c_col_start = bx * TILE_SIZE + col_start;
     
     #pragma unroll
-    for (int i = 0; i < 4; ++i) {
+    for (int i = 0; i < WORK_PER_THREAD; ++i) {
         int r = c_row_start + i;
-        int c = c_col_start;
-        ushort4 val = *reinterpret_cast<ushort4*>(&d_Dist[r * n + c]);
-        col_tile[row_start + i][col_start + 0] = val.x;
-        col_tile[row_start + i][col_start + 1] = val.y;
-        col_tile[row_start + i][col_start + 2] = val.z;
-        col_tile[row_start + i][col_start + 3] = val.w;
+        #pragma unroll
+        for (int j = 0; j < WORK_PER_THREAD; j += 4) {
+            int c = c_col_start + j;
+            ushort4 val = *reinterpret_cast<ushort4*>(&d_Dist[r * n + c]);
+            col_tile[row_start + i][col_start + j + 0] = val.x;
+            col_tile[row_start + i][col_start + j + 1] = val.y;
+            col_tile[row_start + i][col_start + j + 2] = val.z;
+            col_tile[row_start + i][col_start + j + 3] = val.w;
+        }
     }
     
     __syncthreads();
@@ -222,47 +249,53 @@ __global__ void phase3_kernel(unsigned short* __restrict__ d_Dist, int n, int Ro
     int my_row_start = by * TILE_SIZE + row_start;
     int my_col_start = bx * TILE_SIZE + col_start;
     
-    int c_val[4][4];
+    int c_val[WORK_PER_THREAD][WORK_PER_THREAD];
     #pragma unroll
-    for (int i = 0; i < 4; ++i) {
+    for (int i = 0; i < WORK_PER_THREAD; ++i) {
         int r = my_row_start + i;
-        int c = my_col_start;
-        ushort4 val = *reinterpret_cast<ushort4*>(&d_Dist[r * n + c]);
-        c_val[i][0] = val.x;
-        c_val[i][1] = val.y;
-        c_val[i][2] = val.z;
-        c_val[i][3] = val.w;
+        #pragma unroll
+        for (int j = 0; j < WORK_PER_THREAD; j += 4) {
+            int c = my_col_start + j;
+            ushort4 val = *reinterpret_cast<ushort4*>(&d_Dist[r * n + c]);
+            c_val[i][j + 0] = val.x;
+            c_val[i][j + 1] = val.y;
+            c_val[i][j + 2] = val.z;
+            c_val[i][j + 3] = val.w;
+        }
     }
     
     #pragma unroll
     for (int k = 0; k < TILE_SIZE; ++k) {
-        int a[4];
-        int b[4];
+        int a[WORK_PER_THREAD];
+        int b[WORK_PER_THREAD];
         
         #pragma unroll
-        for(int i=0; i<4; ++i) a[i] = row_tile[row_start + i][k];
+        for(int i=0; i<WORK_PER_THREAD; ++i) a[i] = row_tile[row_start + i][k];
         #pragma unroll
-        for(int j=0; j<4; ++j) b[j] = col_tile[k][col_start + j];
+        for(int j=0; j<WORK_PER_THREAD; ++j) b[j] = col_tile[k][col_start + j];
         
         #pragma unroll
-        for (int i = 0; i < 4; ++i) {
+        for (int i = 0; i < WORK_PER_THREAD; ++i) {
             #pragma unroll
-            for (int j = 0; j < 4; ++j) {
+            for (int j = 0; j < WORK_PER_THREAD; ++j) {
                 c_val[i][j] = min(c_val[i][j], a[i] + b[j]);
             }
         }
     }
     
     #pragma unroll
-    for (int i = 0; i < 4; ++i) {
+    for (int i = 0; i < WORK_PER_THREAD; ++i) {
         int r = my_row_start + i;
-        int c = my_col_start;
-        ushort4 val;
-        val.x = c_val[i][0];
-        val.y = c_val[i][1];
-        val.z = c_val[i][2];
-        val.w = c_val[i][3];
-        *reinterpret_cast<ushort4*>(&d_Dist[r * n + c]) = val;
+        #pragma unroll
+        for (int j = 0; j < WORK_PER_THREAD; j += 4) {
+            int c = my_col_start + j;
+            ushort4 val;
+            val.x = c_val[i][j + 0];
+            val.y = c_val[i][j + 1];
+            val.z = c_val[i][j + 2];
+            val.w = c_val[i][j + 3];
+            *reinterpret_cast<ushort4*>(&d_Dist[r * n + c]) = val;
+        }
     }
 }
 
@@ -296,7 +329,7 @@ int main(int argc, char* argv[]) {
 
     cudaMemcpy(d_Dist, h_padded_Dist, sizeof(unsigned short) * padded_n * padded_n, cudaMemcpyHostToDevice);
 
-    dim3 block(16, 16);
+    dim3 block(BLOCK_DIM, BLOCK_DIM);
     
     for (int r = 0; r < round; ++r) {
         phase1_kernel<<<1, block>>>(d_Dist, padded_n, r);
