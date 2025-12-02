@@ -29,7 +29,7 @@ float *h_O = nullptr;
 // 常數 tile 大小 (和 seq-flashattention 一樣)
 
 
-constexpr int BR = 32;  // block rows
+constexpr int BR = 16;  // block rows // 32 代表每個 block 處理 32 個 query rows，因為一個 warp 有 32 個 thread
 constexpr int BC = 32;  // block cols
 constexpr int MAX_D = 64;  // 題目 d 只有 32 或 64
 
@@ -123,58 +123,59 @@ void flash_step_kernel(const float *__restrict__ Q,
                        float inv_sqrt_d)
 {
     // 一個 CUDA block 處理一個 row-block (BR rows)
+    // i_block 是從上到下的第幾個 block
     int i_block   = blockIdx.x;
     int row_start = i_block * BR;
     int col_start = j_block * BC;
 
-    int r = threadIdx.x;                 // 每個 thread 對應 tile 裡的一列 [0, BR)
-    if (r >= BR) return;
+    int lane = threadIdx.x;           // 0..31，一個 warp 裡的 lane
+    int r    = threadIdx.y;           // 0..BR-1，表示 tile 裡的第幾個 row
 
     int global_row = row_start + r;
-    if (global_row >= N) return;
 
     // ---- shared memory: Q_i, K_j, V_j 的 tile ----
-    __shared__ float sQ[BR][MAX_D];      // Q tile: 32 x d
-    __shared__ float sK[BC][MAX_D];      // K tile: 32 x d
-    __shared__ float sV[BC][MAX_D];      // V tile: 32 x d
-
-    // 每個 thread 自己這一列的暫存
-    float sij[BC];
-    float pij[BC];
+    __shared__ float sQ[BR][MAX_D];      // Q tile: BR x d
+    __shared__ float sK[MAX_D][BC];      // K tile: d x BC (Transposed)
+    __shared__ float sV[BC][MAX_D];      // V tile: BC x d
 
     // 取出這列目前的 m, l
-    float old_m = m[global_row];
-    float old_l = l[global_row];
+    float old_m = -FLT_MAX;
+    float old_l = 0.0f;
+    if (global_row < N) {
+        old_m = m[global_row];
+        old_l = l[global_row];
+    }
 
     // --------------------------------------------------------
     // 0. 將 Q_i, K_j, V_j tile 搬到 shared memory
-    //    Q: 每個 thread 負責自己那一 row
     // --------------------------------------------------------
+    
+    // Load Q: Cooperative loading by warp
     if (global_row < N) {
         const float *q_ptr = Q + (size_t)global_row * d;
-        for (int t = 0; t < d; ++t) {
+        for (int t = lane; t < d; t += 32) {
             sQ[r][t] = q_ptr[t];
         }
     } else {
-        for (int t = 0; t < d; ++t) {
+        for (int t = lane; t < d; t += 32) {
             sQ[r][t] = 0.0f;
         }
     }
 
-    // K / V: 所有 thread 共同把 BC*d 個元素搬進來
-    // 用 r 當作 index stride，確保 global memory 連續讀
-    for (int idx = r; idx < BC * d; idx += BR) {
-        int c  = idx / d;    // 哪一個 column (0..BC-1)
-        int t  = idx % d;    // 哪一個維度   (0..d-1)
-        int gcol = col_start + c;
+    // Load K (Transposed) and V: Cooperative loading by block
+    int flat_tid = threadIdx.y * blockDim.x + threadIdx.x;
+    int flat_stride = blockDim.x * blockDim.y;
 
+    for (int idx = flat_tid; idx < BC * d; idx += flat_stride) {
+        int c = idx / d;
+        int t = idx % d;
+
+        int gcol = col_start + c;
         if (gcol < N) {
-            const float *k_ptr = K + (size_t)gcol * d;
-            const float *v_ptr = V + (size_t)gcol * d;
-            sK[c][t] = k_ptr[t];
-            sV[c][t] = v_ptr[t];
+            sK[t][c] = K[gcol * d + t]; // Transposed
+            sV[c][t] = V[gcol * d + t];
         } else {
-            sK[c][t] = 0.0f;
+            sK[t][c] = 0.0f;
             sV[c][t] = 0.0f;
         }
     }
@@ -183,36 +184,43 @@ void flash_step_kernel(const float *__restrict__ Q,
 
     // --------------------------------------------------------
     // 1. 計算 S_row[c] = Q[row] · K[col]^T / sqrt(d)
-    //    全部用 shared memory 的 sQ, sK
+    //    Each lane computes one element of S_row (since BC=32)
     // --------------------------------------------------------
-    for (int c = 0; c < BC; ++c) {
-        float acc = -INFINITY;
-        int gcol = col_start + c;
-        if (gcol < N) {
-            acc = 0.0f;
-            for (int t = 0; t < d; ++t) {
-                acc += sQ[r][t] * sK[c][t];
-            }
-            acc *= inv_sqrt_d;
-        }
-        sij[c] = acc;
+    
+    float my_sij = 0.0f;
+    int c = lane; // This lane corresponds to column c of the tile
+    
+    float val = 0.0f;
+    for (int t = 0; t < d; ++t) {
+        val += sQ[r][t] * sK[t][c];
+    }
+    my_sij = val * inv_sqrt_d;
+    
+    int gcol = col_start + c;
+    if (gcol >= N) {
+        my_sij = -INFINITY;
     }
 
     // --------------------------------------------------------
     // 2. RowMax: tile_m = max_c sij[c]
+    //    Warp All-Reduce
     // --------------------------------------------------------
-    float tile_m = sij[0];
-    for (int c = 1; c < BC; ++c)
-        tile_m = fmaxf(tile_m, sij[c]);
+    float tile_m = my_sij;
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        tile_m = fmaxf(tile_m, __shfl_xor_sync(0xffffffff, tile_m, offset));
+    }
 
     // --------------------------------------------------------
-    // 3. MinusMaxAndExp + RowSum：pij = exp(sij - tile_m)，tile_l = sum pij
+    // 3. MinusMaxAndExp + RowSum
     // --------------------------------------------------------
-    float tile_l = 0.0f;
-    for (int c = 0; c < BC; ++c) {
-        float val = expf(sij[c] - tile_m);
-        pij[c] = val;
-        tile_l += val;
+    float my_pij = 0.0f;
+    if (gcol < N) {
+        my_pij = expf(my_sij - tile_m);
+    }
+    
+    float tile_l = my_pij;
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        tile_l += __shfl_xor_sync(0xffffffff, tile_l, offset);
     }
 
     // --------------------------------------------------------
@@ -223,26 +231,25 @@ void flash_step_kernel(const float *__restrict__ Q,
                    expf(tile_m - mi_new) * tile_l;
 
     // --------------------------------------------------------
-    // 5. 更新 O 這一列：pv 使用 shared memory 中的 sV
+    // 5. 更新 O 這一列
     // --------------------------------------------------------
-    float *o_ptr = O + (size_t)global_row * d;
     float scale_old = (old_l > 0.0f) ? old_l * expf(old_m - mi_new) : 0.0f;
     float scale_new = expf(tile_m - mi_new);
 
-    if (li_new > 0.0f) {
-        for (int dim = 0; dim < d; ++dim) {
-            float old_o = o_ptr[dim];
+    if (li_new > 0.0f && global_row < N) {
+        float *o_ptr = O + (size_t)global_row * d;
 
+        // Parallelize over d (dim) using warp
+        for (int dim = lane; dim < d; dim += 32) {
             float pv = 0.0f;
-            for (int c = 0; c < BC; ++c) {
-                int gcol = col_start + c;
-                if (gcol < N) {
-                    float p = pij[c];
-                    float v_val = sV[c][dim];   // 從 shared memory 讀
-                    pv += p * v_val;
-                }
+            // Sum over c (0..BC-1)
+            for (int k = 0; k < BC; ++k) {
+                // Broadcast pij[k] from lane k
+                float val_pij = __shfl_sync(0xffffffff, my_pij, k);
+                pv += val_pij * sV[k][dim];
             }
 
+            float old_o = o_ptr[dim];
             float out = (scale_old * old_o + scale_new * pv) / li_new;
             o_ptr[dim] = out;
         }
@@ -251,8 +258,10 @@ void flash_step_kernel(const float *__restrict__ Q,
     // --------------------------------------------------------
     // 6. 寫回這一列的 m, l
     // --------------------------------------------------------
-    m[global_row] = mi_new;
-    l[global_row] = li_new;
+    if (lane == 0 && global_row < N) {
+        m[global_row] = mi_new;
+        l[global_row] = li_new;
+    }
 }
 
 
@@ -275,7 +284,7 @@ void run_flashattention_batch(const float *d_Q,
     CHECK_CUDA(cudaMalloc(&d_l, N * sizeof(float)));
 
     // init m, l, O
-    int threads = 256;
+    int threads = 256; // 只是為了初始化用的 thread 數量
     int blocks_for_rows = (N + threads - 1) / threads;
     int blocks_for_O    = (N * d + threads - 1) / threads;
 
@@ -286,14 +295,15 @@ void run_flashattention_batch(const float *d_Q,
     CHECK_CUDA(cudaDeviceSynchronize());
 
     // tile 切法
-    int tr = N / BR;   // row tiles
-    int tc = N / BC;   // col tiles
+    int tr = (N + BR - 1) / BR;    // row tiles
+    int tc = (N + BC - 1) / BC;   // col tiles
 
     float inv_sqrt_d = 1.0f / sqrtf((float)d);
 
     for (int j_block = 0; j_block < tc; ++j_block) {
         dim3 grid(tr);          // 每個 block 處理一個 row-block (BR rows)
-        dim3 block(BR);         // 32 threads, 每 thread 對應一個 row
+        //dim3 block(BR);         // 32 threads, 每 thread 對應一個 row
+        dim3 block(32, BR);          // x: 32 lanes, y: BR rows → 32*BR threads
 
         flash_step_kernel<<<grid, block>>>(
             d_Q, d_K, d_V,
