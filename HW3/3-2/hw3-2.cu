@@ -1,14 +1,15 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <cuda_runtime.h>
+#include <nvtx3/nvToolsExt.h>
 
 #ifndef TILE_SIZE
-#define TILE_SIZE 64
+#define TILE_SIZE 64 // 每個 block 處理的子矩陣大小，就是 blocking factor
 #endif
 
-#define WORK_PER_THREAD 4
+#define WORK_PER_THREAD 4 // 每個 thread 負責計算的元素數量 (假設 TILE_SIZE 可被 WORK_PER_THREAD 整除)
 
-#define BLOCK_DIM (TILE_SIZE / WORK_PER_THREAD)
+#define BLOCK_DIM (TILE_SIZE / WORK_PER_THREAD) // 每個 block 的 thread 數量
 
 const unsigned short INF = 65535;
 
@@ -20,26 +21,31 @@ void output(char* outFileName);
 
 int ceil_int(int a, int b) { return (a + b - 1) / b; }
 
+// Phase 1: Process the pivot block
+// 每個 thread 負責計算 WORK_PER_THREAD x WORK_PER_THREAD 個元素
 __global__ void phase1_kernel(unsigned short* __restrict__ d_Dist, int n, int Round) {
     __shared__ unsigned short tile[TILE_SIZE][TILE_SIZE + 1];
 
     int tx = threadIdx.x; 
     int ty = threadIdx.y; 
 
+    // row_start, col_start 是這個 thread 在 tile 內負責的那塊 4×4 子區的左上角，就是 local index
     int row_start = ty * WORK_PER_THREAD;
     int col_start = tx * WORK_PER_THREAD;
 
+    // global_row_start, global_col_start 是這個 thread 在整個矩陣內負責的那塊 4×4 子區的左上角，就是 global index
     int global_row_start = Round * TILE_SIZE + row_start;
     int global_col_start = Round * TILE_SIZE + col_start;
 
+    // Load data from global memory to shared memory
     #pragma unroll
     for (int i = 0; i < WORK_PER_THREAD; ++i) {
         int r = global_row_start + i;
         #pragma unroll
-        for (int j = 0; j < WORK_PER_THREAD; j += 4) {
+        for (int j = 0; j < WORK_PER_THREAD; j += 4) { // 一次讀取 4 個 ushort，這樣每個 row 只需要 1 次 global memory 存取
             int c = global_col_start + j;
             if (r < n && c < n) {
-                 ushort4 val = *reinterpret_cast<ushort4*>(&d_Dist[r * n + c]);
+                 ushort4 val = *reinterpret_cast<ushort4*>(&d_Dist[r * n + c]); // 利用 ushort4 一次讀取 4 個 ushort
                  tile[row_start + i][col_start + j + 0] = val.x;
                  tile[row_start + i][col_start + j + 1] = val.y;
                  tile[row_start + i][col_start + j + 2] = val.z;
@@ -50,10 +56,11 @@ __global__ void phase1_kernel(unsigned short* __restrict__ d_Dist, int n, int Ro
 
     __syncthreads();
 
+    // Compute shortest paths within the tile using registers
     #pragma unroll
     for (int k = 0; k < TILE_SIZE; ++k) {
-        int a[WORK_PER_THREAD];
-        int b[WORK_PER_THREAD];
+        int a[WORK_PER_THREAD]; // store tile[row_start + i][k] in registers
+        int b[WORK_PER_THREAD]; // store tile[k][col_start + j] in registers
         
         #pragma unroll
         for(int i=0; i<WORK_PER_THREAD; ++i) a[i] = tile[row_start + i][k];
@@ -70,6 +77,7 @@ __global__ void phase1_kernel(unsigned short* __restrict__ d_Dist, int n, int Ro
         __syncthreads();
     }
     
+    // Store results back to global memory
     #pragma unroll
     for (int i = 0; i < WORK_PER_THREAD; ++i) {
         int r = global_row_start + i;
@@ -88,19 +96,22 @@ __global__ void phase1_kernel(unsigned short* __restrict__ d_Dist, int n, int Ro
     }
 }
 
+// Phase 2: Process the row and column blocks
 __global__ void phase2_kernel(unsigned short* __restrict__ d_Dist, int n, int Round) {
-    __shared__ unsigned short pivot[TILE_SIZE][TILE_SIZE + 1];
-    __shared__ unsigned short target[TILE_SIZE][TILE_SIZE + 1];
+    __shared__ unsigned short pivot[TILE_SIZE][TILE_SIZE + 1]; // Shared memory for the pivot block
+    __shared__ unsigned short target[TILE_SIZE][TILE_SIZE + 1]; // Shared memory for the target block (row or column pivot)
     
     int tx = threadIdx.x;
     int ty = threadIdx.y;
     int row_start = ty * WORK_PER_THREAD;
     int col_start = tx * WORK_PER_THREAD;
     
+    // blk_idx 是這個 block 在 row/column blocks 中的索引, grid size 是 (round, 2)
     int blk_idx = blockIdx.x;
-    if (blk_idx == Round) return;
+    if (blk_idx == Round) return; // Skip the pivot block itself
     
-    int mode = blockIdx.y; 
+    // grid 一列給 row blocks, 一列給 column blocks
+    int mode = blockIdx.y; // 0: row block, 1: column block
     
     int pivot_row_start = Round * TILE_SIZE + row_start;
     int pivot_col_start = Round * TILE_SIZE + col_start;
@@ -115,6 +126,7 @@ __global__ void phase2_kernel(unsigned short* __restrict__ d_Dist, int n, int Ro
         target_col_start = Round * TILE_SIZE + col_start;
     }
     
+    // Load pivot block into shared memory
     #pragma unroll
     for (int i = 0; i < WORK_PER_THREAD; ++i) {
         int r = pivot_row_start + i;
@@ -129,6 +141,7 @@ __global__ void phase2_kernel(unsigned short* __restrict__ d_Dist, int n, int Ro
         }
     }
     
+    // Load target block into shared memory
     #pragma unroll
     for (int i = 0; i < WORK_PER_THREAD; ++i) {
         int r = target_row_start + i;
@@ -143,8 +156,11 @@ __global__ void phase2_kernel(unsigned short* __restrict__ d_Dist, int n, int Ro
         }
     }
     
-    __syncthreads();
+    __syncthreads(); // Synchronize to make sure the tiles are loaded
     
+    // Load target block values into registers
+    // Load target[row_start + i][col_start + j] into t_val[i][j] 因為後面會多次使用，所以先放到 register 裡
+    // 一次 load 4*4 個元素 (per thread workload)
     int t_val[WORK_PER_THREAD][WORK_PER_THREAD];
     #pragma unroll
     for(int i=0; i<WORK_PER_THREAD; ++i) {
@@ -154,6 +170,7 @@ __global__ void phase2_kernel(unsigned short* __restrict__ d_Dist, int n, int Ro
         }
     }
     
+    // Compute shortest paths
     #pragma unroll
     for (int k = 0; k < TILE_SIZE; ++k) {
         int a[WORK_PER_THREAD]; 
@@ -180,6 +197,7 @@ __global__ void phase2_kernel(unsigned short* __restrict__ d_Dist, int n, int Ro
         }
     }
     
+    // Store results from registers back to global memory
     #pragma unroll
     for (int i = 0; i < WORK_PER_THREAD; ++i) {
         int r = target_row_start + i;
@@ -196,11 +214,12 @@ __global__ void phase2_kernel(unsigned short* __restrict__ d_Dist, int n, int Ro
     }
 }
 
+// Phase 3: Process the remaining blocks
 __global__ void phase3_kernel(unsigned short* __restrict__ d_Dist, int n, int Round) {
     int bx = blockIdx.x;
     int by = blockIdx.y;
     
-    if (bx == Round || by == Round) return;
+    if (bx == Round || by == Round) return; // Skip the row pivot and column pivot blocks
     
     __shared__ unsigned short row_tile[TILE_SIZE][TILE_SIZE + 1]; 
     __shared__ unsigned short col_tile[TILE_SIZE][TILE_SIZE + 1]; 
@@ -210,6 +229,7 @@ __global__ void phase3_kernel(unsigned short* __restrict__ d_Dist, int n, int Ro
     int row_start = ty * WORK_PER_THREAD;
     int col_start = tx * WORK_PER_THREAD;
     
+    // Load row pivot block into shared memory
     int row_row_start = by * TILE_SIZE + row_start;
     int row_col_start = Round * TILE_SIZE + col_start;
     
@@ -227,6 +247,7 @@ __global__ void phase3_kernel(unsigned short* __restrict__ d_Dist, int n, int Ro
         }
     }
     
+    // Load column pivot block into shared memory
     int c_row_start = Round * TILE_SIZE + row_start;
     int c_col_start = bx * TILE_SIZE + col_start;
     
@@ -249,7 +270,7 @@ __global__ void phase3_kernel(unsigned short* __restrict__ d_Dist, int n, int Ro
     int my_row_start = by * TILE_SIZE + row_start;
     int my_col_start = bx * TILE_SIZE + col_start;
     
-    int c_val[WORK_PER_THREAD][WORK_PER_THREAD];
+    int c_val[WORK_PER_THREAD][WORK_PER_THREAD]; // Store current block values in registers
     #pragma unroll
     for (int i = 0; i < WORK_PER_THREAD; ++i) {
         int r = my_row_start + i;
@@ -269,6 +290,7 @@ __global__ void phase3_kernel(unsigned short* __restrict__ d_Dist, int n, int Ro
         int a[WORK_PER_THREAD];
         int b[WORK_PER_THREAD];
         
+        // Load row and column values into registers
         #pragma unroll
         for(int i=0; i<WORK_PER_THREAD; ++i) a[i] = row_tile[row_start + i][k];
         #pragma unroll
@@ -299,13 +321,16 @@ __global__ void phase3_kernel(unsigned short* __restrict__ d_Dist, int n, int Ro
     }
 }
 
+// Main function
 int main(int argc, char* argv[]) {
     if (argc < 3) {
         fprintf(stderr, "Usage: %s input.bin output.bin\n", argv[0]);
         return 1;
     }
 
+    nvtxRangePush("IO");
     input(argv[1]);
+    nvtxRangePop();
 
     int padded_n = ceil_int(n, TILE_SIZE) * TILE_SIZE;
     int round = padded_n / TILE_SIZE;
@@ -315,8 +340,10 @@ int main(int argc, char* argv[]) {
 
     unsigned short* h_padded_Dist = (unsigned short*)malloc(sizeof(unsigned short) * padded_n * padded_n);
     
+    // Initialize padded distance matrix with INF
     for (int i = 0; i < padded_n * padded_n; ++i) h_padded_Dist[i] = INF;
     
+    // Copy original Dist into padded Dist
     for (int i = 0; i < n; ++i) {
         for (int j = 0; j < n; ++j) {
             h_padded_Dist[i * padded_n + j] = Dist[i * n + j];
@@ -349,7 +376,9 @@ int main(int argc, char* argv[]) {
         }
     }
 
+    nvtxRangePush("IO");
     output(argv[2]);
+    nvtxRangePop();
     
     free(h_padded_Dist);
     free(Dist);
@@ -357,6 +386,7 @@ int main(int argc, char* argv[]) {
     return 0;
 }
 
+// Input function
 void input(char* infile) {
     FILE* file = fopen(infile, "rb");
     fread(&n, sizeof(int), 1, file);
@@ -382,6 +412,7 @@ void input(char* infile) {
     fclose(file);
 }
 
+// Output function
 void output(char* outFileName) {
     FILE* outfile = fopen(outFileName, "wb");
     int* outBuf = (int*)malloc(sizeof(int) * n * n);

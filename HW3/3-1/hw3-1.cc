@@ -15,7 +15,7 @@ static int Dist[V][V];
 
 int main(int argc, char* argv[]) {
     input(argv[1]);
-    int B = 512;
+    int B = 512; 
     block_FW(B);
     output(argv[2]);
     return 0;
@@ -66,10 +66,10 @@ void block_FW(int B) {
         cal(B, r, r, r, 1, 1);
 
         /* Phase 2: update pivot row/column */
-        cal(B, r, r, 0, r, 1);
-        cal(B, r, r, r + 1, round - r - 1, 1);
-        cal(B, r, 0, r, 1, r);
-        cal(B, r, r + 1, r, 1, round - r - 1);
+        cal(B, r, r, 0, r, 1); // pivot row 左半部分
+        cal(B, r, r, r + 1, round - r - 1, 1); // pivot row 右半部分
+        cal(B, r, 0, r, 1, r); // pivot column 上半部分
+        cal(B, r, r + 1, r, 1, round - r - 1); // pivot column 下半部分
 
         /* Phase 3 update remain blocks */
         cal(B, r, 0, 0, r, r);
@@ -84,6 +84,9 @@ void cal(
     int block_end_x = block_start_x + block_height;
     int block_end_y = block_start_y + block_width;
 
+    // b_i, b_j is the index of block which to be updated
+    // k is the index of block which to be used to update
+    // i, j is the original index of Dist matrix
     # pragma omp parallel for schedule(static) collapse(2)
     for (int b_i = block_start_x; b_i < block_end_x; ++b_i) {
         for (int b_j = block_start_y; b_j < block_end_y; ++b_j) {
