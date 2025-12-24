@@ -18,6 +18,11 @@ import polars as pl
 import matplotlib.pyplot as plt
 from matplotlib.ticker import MultipleLocator
 
+from pathlib import Path
+import seaborn as sns
+
+sns.set_theme(style="whitegrid")
+
 NVTX_RANGE_TO_BUCKET = {":CPU": "CPU", ":IO": "IO", ":Comm": "Comm"}
 TIME_COL = "Total Time (ms)"
 RANGE_COL = "Range"
@@ -136,27 +141,35 @@ def collect_summary(root: Path, case: str) -> pl.DataFrame:
            .drop("baseline_total_s")
     return df
 
-
 def plot_runtime_breakdown(df: pl.DataFrame, out_path: Path, case: str, dpi: int = 150) -> None:
     x = df["N"].to_list()
     io = df["io_s"].to_list()
     comm = df["comm_s"].to_list()
     cpu = df["cpu_s"].to_list()
-    import matplotlib.pyplot as plt
-    from matplotlib.ticker import MultipleLocator
 
     fig, ax = plt.subplots(figsize=(9, 5), dpi=dpi)
-    p1 = ax.bar(x, io, label="I/O", color="#377eb8")
-    p2 = ax.bar(x, comm, bottom=io, label="Comm", color="#e41a1c")
-    bottom_cpu = [i + c for i, c in zip(io, comm)]
-    p3 = ax.bar(x, cpu, bottom=bottom_cpu, label="CPU", color="#4daf4a")
 
-    ax.set_xlabel("# of cores (12 cores/node)")
-    ax.set_ylabel("runtime (seconds)")
-    ax.set_title(f"Runtime breakdown by cores – case {case}")
+    # 色彩方案
+    colors = sns.color_palette("Set2", 3)
+
+    # 堆疊柱狀圖
+    p1 = ax.bar(x, io, label="I/O", color=colors[0])
+    p2 = ax.bar(x, comm, bottom=io, label="Comm", color=colors[1])
+    bottom_cpu = [i + c for i, c in zip(io, comm)]
+    p3 = ax.bar(x, cpu, bottom=bottom_cpu, label="CPU", color=colors[2])
+
+    # 標籤與格線
+    ax.set_xlabel("# of cores (12 cores/node)", fontsize=12, fontweight="bold")
+    ax.set_ylabel("Runtime (seconds)", fontsize=12, fontweight="bold")
+    ax.set_title(f"Runtime Breakdown by Cores – Case {case}", fontsize=14, fontweight="bold", pad=15)
     ax.xaxis.set_major_locator(MultipleLocator(4))
-    ax.legend()
-    ax.grid(axis="y", linestyle=":", alpha=0.4)
+    ax.legend(frameon=True, fontsize=10)
+    ax.grid(axis="y", linestyle=":", alpha=0.5)
+
+    # 邊界線微調
+    for spine in ["top", "right"]:
+        ax.spines[spine].set_visible(False)
+
     fig.tight_layout()
     fig.savefig(out_path, bbox_inches="tight")
     plt.close(fig)
@@ -165,19 +178,30 @@ def plot_runtime_breakdown(df: pl.DataFrame, out_path: Path, case: str, dpi: int
 def plot_speedup(df: pl.DataFrame, out_path: Path, case: str, dpi: int = 150) -> None:
     x = df["N"].to_list()
     y = df["speedup"].to_list()
-    import matplotlib.pyplot as plt
-    from matplotlib.ticker import MultipleLocator
 
     fig, ax = plt.subplots(figsize=(9, 5), dpi=dpi)
-    ax.plot(x, y, marker="s")
-    ax.set_xlabel("# cores (12 cores/node)")
-    ax.set_ylabel("speedup")
-    ax.set_title(f"Speedup vs cores – case {case}")
+    colors = sns.color_palette("Set2", 2)
+
+    # speedup 曲線
+    ax.plot(x, y, marker="o", markersize=6, linewidth=2.2, color=colors[0], label="Measured")
+
+    # 理想 speedup 線
+    ax.plot(x, x, linestyle="--", color=colors[1], linewidth=1.8, label="Ideal")
+
+    ax.set_xlabel("# of cores (12 cores/node)", fontsize=12, fontweight="bold")
+    ax.set_ylabel("Speedup", fontsize=12, fontweight="bold")
+    ax.set_title(f"Speedup vs Cores – Case {case}", fontsize=14, fontweight="bold", pad=15)
     ax.xaxis.set_major_locator(MultipleLocator(4))
-    ax.grid(True, linestyle=":", alpha=0.4)
+    ax.legend(frameon=True, fontsize=10)
+    ax.grid(True, linestyle=":", alpha=0.5)
+
+    for spine in ["top", "right"]:
+        ax.spines[spine].set_visible(False)
+
     fig.tight_layout()
     fig.savefig(out_path, bbox_inches="tight")
     plt.close(fig)
+
 
 
 def main() -> None:

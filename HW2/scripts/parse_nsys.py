@@ -33,6 +33,12 @@ import polars as pl
 import matplotlib.pyplot as plt
 from matplotlib.ticker import MultipleLocator
 
+from pathlib import Path
+import seaborn as sns
+
+# === 統一繪圖風格 ===
+sns.set_theme(style="whitegrid")
+
 # --- Constants ---
 NVTX_RANGE_TO_BUCKET = {
     ":CPU": "CPU",
@@ -194,46 +200,69 @@ def collect_summary(root: Path, case: str) -> pl.DataFrame:
 
 
 def plot_runtime_breakdown(df: pl.DataFrame, out_path: Path, case: str, dpi: int = 150) -> None:
+    """Plot runtime composition (I/O, Comm, CPU) as stacked bars."""
     x = df["N"].to_list()
     io = df["io_s"].to_list()
     comm = df["comm_s"].to_list()
     cpu = df["cpu_s"].to_list()
 
     fig, ax = plt.subplots(figsize=(9, 5), dpi=dpi)
-    # Stack order: IO (bottom), Comm (middle), CPU (top)
-    p1 = ax.bar(x, io, label="I/O", color="#377eb8")
-    p2 = ax.bar(x, comm, bottom=io, label="Comm", color="#e41a1c")
-    bottom_cpu = [i + c for i, c in zip(io, comm)]
-    p3 = ax.bar(x, cpu, bottom=bottom_cpu, label="CPU", color="#4daf4a")
+    colors = sns.color_palette("Set2", 3)
 
-    ax.set_xlabel("# of cores (12 cores/node)")
-    ax.set_ylabel("runtime (seconds)")
-    ax.set_title(f"Runtime breakdown by cores – case {case}")
-    # ax.set_xticks(x)
+    # Stack: IO (bottom), Comm (middle), CPU (top)
+    p1 = ax.bar(x, io, label="I/O", color=colors[0])
+    p2 = ax.bar(x, comm, bottom=io, label="Comm", color=colors[1])
+    bottom_cpu = [i + c for i, c in zip(io, comm)]
+    p3 = ax.bar(x, cpu, bottom=bottom_cpu, label="CPU", color=colors[2])
+
+    # Labels & grid
+    ax.set_xlabel("# of cores (12 cores/node)", fontsize=12, fontweight="bold")
+    ax.set_ylabel("Runtime (seconds)", fontsize=12, fontweight="bold")
+    ax.set_title(f"Runtime Breakdown by Cores – Case {case}", fontsize=14, fontweight="bold", pad=15)
     ax.xaxis.set_major_locator(MultipleLocator(6))
-    ax.legend()
-    ax.grid(axis="y", linestyle=":", alpha=0.4)
+    ax.grid(axis="y", linestyle=":", alpha=0.5)
+    ax.legend(frameon=True, fontsize=10)
+
+    # Hide top/right borders
+    for spine in ["top", "right"]:
+        ax.spines[spine].set_visible(False)
+
     fig.tight_layout()
     fig.savefig(out_path, bbox_inches="tight")
     plt.close(fig)
+    print(f"[DONE] Saved runtime breakdown plot -> {out_path}")
 
 
 def plot_speedup(df: pl.DataFrame, out_path: Path, case: str, dpi: int = 150) -> None:
+    """Plot measured speedup and ideal line."""
     x = df["N"].to_list()
     y = df["speedup"].to_list()
 
     fig, ax = plt.subplots(figsize=(9, 5), dpi=dpi)
-    ax.plot(x, y, marker="s")
-    ax.set_xlabel("# cores (12 cores/node)")
-    ax.set_ylabel("speedup")
-    ax.set_title(f"Speedup vs cores – case {case}")
-    # ax.set_xticks(x)
+    colors = sns.color_palette("Set2", 2)
+
+    # Actual speedup
+    ax.plot(x, y, marker="o", markersize=6, linewidth=2.2, color=colors[0], label="Measured")
+
+    # Ideal speedup
+    ax.plot(x, x, linestyle="--", linewidth=1.8, color=colors[1], label="Ideal")
+
+    # Labels & grid
+    ax.set_xlabel("# of cores (12 cores/node)", fontsize=12, fontweight="bold")
+    ax.set_ylabel("Speedup", fontsize=12, fontweight="bold")
+    ax.set_title(f"Speedup vs Cores – Case {case}", fontsize=14, fontweight="bold", pad=15)
     ax.xaxis.set_major_locator(MultipleLocator(6))
-    ax.grid(True, linestyle=":", alpha=0.4)
+    ax.grid(True, linestyle=":", alpha=0.5)
+    ax.legend(frameon=True, fontsize=10)
+
+    # Hide top/right borders
+    for spine in ["top", "right"]:
+        ax.spines[spine].set_visible(False)
+
     fig.tight_layout()
     fig.savefig(out_path, bbox_inches="tight")
     plt.close(fig)
-
+    print(f"[DONE] Saved speedup plot -> {out_path}")
 
 def main() -> None:
     ap = argparse.ArgumentParser(description="Parse nsys nvtx_sum CSVs and plot runtime breakdown & speedup.")

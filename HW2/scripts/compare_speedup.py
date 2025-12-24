@@ -31,11 +31,13 @@ from __future__ import annotations
 
 import argparse
 from pathlib import Path
-from typing import Tuple
-
 import polars as pl
 import matplotlib.pyplot as plt
 from matplotlib.ticker import MultipleLocator
+import seaborn as sns
+
+
+sns.set_theme(style="whitegrid")
 
 
 def _ensure_speedup(df: pl.DataFrame, label: str) -> pl.DataFrame:

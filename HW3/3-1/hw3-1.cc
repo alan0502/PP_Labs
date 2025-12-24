@@ -59,10 +59,11 @@ int ceil(int a, int b) { return (a + b - 1) / b; }
 
 void block_FW(int B) {
     int round = ceil(n, B);
+    // Rounds cannot be parallelized
     for (int r = 0; r < round; ++r) {
         printf("%d %d\n", r, round);
         fflush(stdout);
-        /* Phase 1: update pivot block */
+        // Phase 1: update pivot block, cannot parallel (block_width=1, block_height=1)
         cal(B, r, r, r, 1, 1);
 
         /* Phase 2: update pivot row/column */
@@ -71,7 +72,7 @@ void block_FW(int B) {
         cal(B, r, 0, r, 1, r); // pivot column 上半部分
         cal(B, r, r + 1, r, 1, round - r - 1); // pivot column 下半部分
 
-        /* Phase 3 update remain blocks */
+        // Phase 3: update remain blocks, can parallel (width=round-1, height=round-1)
         cal(B, r, 0, 0, r, r);
         cal(B, r, 0, r + 1, round - r - 1, r);
         cal(B, r, r + 1, 0, r, round - r - 1);

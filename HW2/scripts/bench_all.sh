@@ -76,7 +76,7 @@ rm *.out
 
 # Convert all .nsys-rep to CSV with GNU parallel via srun on 1 task
 find ./logs/nsys_reports -type f -name '*.nsys-rep' | \
-  /beegfs/home/pp25/pp25s065/HW2/.pixi/envs/default/bin/parallel -j48 'srun -N1 -n1 --mpi=none --exclusive --cpu-bind=cores \
+  /beegfs/home/pp25/pp25s065/PP2025/HW2/.pixi/envs/default/bin/parallel -j48 'srun -N1 -n1 --mpi=none --exclusive --cpu-bind=cores \
     nsys stats {} --force-export=true --report nvtx_sum --timeunit ms --format csv > {.}.csv'
 
 # Parse and plot using polars-based script
